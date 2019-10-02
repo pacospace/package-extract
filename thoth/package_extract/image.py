@@ -24,6 +24,13 @@ import tarfile
 import typing
 import stat
 from shlex import quote
+import hashlib
+from pathlib import Path
+import glob
+from typing import Dict
+from typing import List
+from typing import Generator
+from collections import deque
 
 from thoth.analyzer import run_command
 from thoth.common import cwd
@@ -52,7 +59,7 @@ def _normalize_mercator_output(path: str, output: dict) -> dict:
 
         # Now point to the correct path, absolute inside the image.
         if "path" in entry:
-            entry["path"] = entry["path"][len(path) :]
+            entry["path"] = entry["path"][len(path):]
 
     return output.get("items", [])
 
@@ -69,20 +76,22 @@ def _parse_repoquery(output: str) -> dict:
             continue
 
         if line.startswith("package: "):
-            package = line[len("package: ") :]
+            package = line[len("package: "):]
             if package in result:
                 _LOGGER.warning(
-                    "Package {!r} was already stated in the repoquery output, "
-                    "dependencies will be appended"
+                    "Package %r was already stated in the repoquery output, "
+                    "dependencies will be appended",
+                    package
                 )
                 continue
             result[package] = []
         elif line.startswith("dependency: "):
             if not package:
                 _LOGGER.error(
-                    "Stated dependency %r has no package associated (parser error?), this error is not fatal"
+                    "Stated dependency %r has no package associated (parser error?), this error is not fatal",
+                    package
                 )
-            result[package].append(line[len("dependency: ") :])
+            result[package].append(line[len("dependency: "):])
 
     return result
 
@@ -178,6 +187,51 @@ def _parse_deb_dependency_line(line_str: str) -> typing.List[tuple]:
     return result
 
 
+def _gather_python_file_digests(path: str) -> typing.List[dict]:
+    """Calculate checksum for all Python files inside image."""
+    digests = []
+    for root, dirs, files in os.walk(path):
+        for file_ in files:
+            if file_.endswith('.py'):
+                filepath = os.path.join(root, file_)
+                if os.path.isfile(filepath):
+                    digest = hashlib.sha256()
+                    with open(filepath, 'rb') as afile:
+                        digest.update(afile.read())
+                    digests.append({
+                        'filepath': filepath[len(path):],
+                        'sha256': digest.hexdigest()
+                    })
+    return digests
+
+
+def _gather_os_info(path: str) -> dict:
+    """Gather information about operating system used."""
+    result = {}
+    os_release_file = Path(path) / "etc/os-release"
+    if os_release_file.exists():
+        try:
+            content = os_release_file.read_text()
+        except Exception as exc:
+            _LOGGER.warning(
+                "Failed to read /etc/os-release file to gather operating system information: %s",
+                str(exc)
+            )
+            return result
+
+        for line in content.splitlines():
+            parts = line.split("=", maxsplit=1)
+            if len(parts) != 2:
+                continue
+
+            key = parts[0].lower()
+            value = parts[1].strip('"')
+
+            result[key] = value
+
+    return result
+
+
 def _run_apt_cache_show(
     path: str, deb_packages: typing.List[dict], timeout: int = None
 ) -> list:
@@ -220,18 +274,136 @@ def _run_apt_cache_show(
         entry["pre-depends"], entry["depends"], entry["replaces"] = [], [], []
         for line in output.splitlines():
             if line.startswith("Pre-Depends: "):
-                deps = _parse_deb_dependency_line(line[len("Pre-Depends: ") :])
+                deps = _parse_deb_dependency_line(line[len("Pre-Depends: "):])
                 entry["pre-depends"] = [{"name": d[0], "version": d[1]} for d in deps]
             elif line.startswith("Depends: "):
-                deps = _parse_deb_dependency_line(line[len("Depends: ") :])
+                deps = _parse_deb_dependency_line(line[len("Depends: "):])
                 entry["depends"] = [{"name": d[0], "version": d[1]} for d in deps]
             elif line.startswith("Replaces: "):
-                deps = _parse_deb_dependency_line(line[len("Replaces: ") :])
+                deps = _parse_deb_dependency_line(line[len("Replaces: "):])
                 entry["replaces"] = [{"name": d[0], "version": d[1]} for d in deps]
 
         result.append(entry)
 
     return result
+
+
+def _get_lib_dir_symbols(result: dict, container_path: str, path: str) -> None:
+    """Get library symbols from a directory."""
+    path = path[1:] if path.startswith("/") else path
+    for so_file_path in glob.glob(os.path.join(container_path, path, "*.so*")):
+        # We grep for '0 A' here because all exported symbols are outputted by nm like:
+        # 00000000 A GLIBC_1.x or:
+        # 0000000000000000 A GLIBC_1.x
+        command = f"nm -D {so_file_path!r} | grep '0 A'"
+
+        # Drop path to the extracted container in the output.
+        so_file_path = so_file_path[len(container_path):]
+
+        _LOGGER.debug("Gathering symbols from %r", so_file_path)
+        command_result = run_command(command, timeout=120, raise_on_error=False)
+        if command_result.return_code != 0:
+            _LOGGER.warning(
+                "Failed to obtain library symbols from %r; stderr: %s, stdout: %s",
+                so_file_path,
+                command_result.stderr,
+                command_result.stdout
+            )
+            continue
+
+        if so_file_path not in result:
+            result[so_file_path] = set()
+
+        for line in command_result.stdout.splitlines():
+            columns = line.split(' ')
+            if len(columns) > 2:
+                result[so_file_path].add(columns[2])
+
+
+def _ld_config_entries(path: str) -> Generator[str, None, None]:
+    """Iterate over entries in ld.so.conf, recursively."""
+    stack = deque([("etc", "ld.so.conf")])
+
+    while stack:
+        relative_path, conf_file = stack.pop()
+        try:
+            with open(os.path.join(path, relative_path, conf_file), "r") as f:
+                for line in f.readlines():
+                    if line.startswith("include "):
+                        line = line[len("include "):]
+                        # Includes are relative to /etc/
+                        if not line.startswith("/"):
+                            line = os.path.join("etc", line)
+
+                    if not line:
+                        continue
+
+                    if line.startswith("/"):
+                        to_glob = os.path.join(path, line[1:])
+                    else:
+                        to_glob = os.path.join(path, relative_path, line)
+
+                    for entry_path in glob.glob(to_glob):
+                        if os.path.isdir(entry_path):
+                            yield line
+                        elif os.path.isfile(entry_path):
+                            # ld.so.conf can point to another configuration files.
+                            # "foo/nar"
+                            stack.append(
+                                (os.path.dirname(os.path.join(relative_path, conf_file)), os.path.basename(entry_path))
+                            )
+                        else:
+                            _LOGGER.warning("Skipping entry %r from symbols extraction not a file or directory", line)
+        except Exception as exc:
+            _LOGGER.warning("Failed to analyze file %r for available symbols: %s", conf_file, str(exc))
+
+
+def _ld_config_symbols(result: dict, path: str) -> None:
+    """Gather library symbols based on ld.so.conf."""
+    _LOGGER.debug("Gathering symbols based on ld.so.conf file")
+    for entry in _ld_config_entries(path):
+        try:
+            _get_lib_dir_symbols(result, path, entry)
+        except Exception as exc:
+            _LOGGER.warning("Cannot load symbols from %r (based on ld.so.conf configuration): %s", entry, str(exc))
+
+
+def _ld_env_symbols(result: dict, path: str) -> None:
+    """Gather library symbols based on entries in LD_LIBRARY_PATH environment variable."""
+    ld_paths = os.getenv("LD_LIBRARY_PATH")
+
+    if ld_paths is None:
+        _LOGGER.debug("No LD_LIBRARY_PATH detected to gather system symbols")
+        return
+
+    for p in ld_paths.split(":"):
+        _get_lib_dir_symbols(result, path, p[1:])
+
+
+def _get_system_symbols(path: str) -> Dict[str, List[str]]:
+    """Get library symbols found in relevant directories, configuration and environment variables."""
+    result = {}
+    _get_lib_dir_symbols(result, path, "usr/lib64")
+    _get_lib_dir_symbols(result, path, "lib64")
+    _get_lib_dir_symbols(result, path, "usr/lib32")
+    _get_lib_dir_symbols(result, path, "lib32")
+    _get_lib_dir_symbols(result, path, "usr/lib")
+    _get_lib_dir_symbols(result, path, "lib")
+    _ld_config_symbols(result, path)
+    # XXX: Commented out as we need to handle environment variables for this during container image extraction.
+    # _ld_env_symbols(result, path)
+    # Convert to list as a result, also good for serialization into JSON happening later on.
+    return {path: list(symbols) for path, symbols in result.items()}
+
+
+def _get_layer_digest_v1(layer_def: dict):
+    """Get digest of a layer for v1 container image format."""
+    return layer_def["blobSum"].split(":", maxsplit=1)[-1]
+
+
+def _get_layer_digest_v2(layer_def: dict):
+    """Get digest of a layer for v2 container image format."""
+    return layer_def["digest"].split(":", maxsplit=1)[-1]
 
 
 def construct_rootfs(dir_path: str, rootfs_path: str) -> list:
@@ -247,16 +419,22 @@ def construct_rootfs(dir_path: str, rootfs_path: str) -> list:
             "image in {}".format(os.path.join(dir_path, "manifest.json"))
         ) from exc
 
-    if manifest.get("schemaVersion") != 2:
+    if manifest.get("schemaVersion") == 1:
+        manifest_layers = manifest["fsLayers"]
+        get_layer_digest = _get_layer_digest_v1
+    elif manifest.get("schemaVersion") == 2:
+        manifest_layers = manifest["layers"]
+        get_layer_digest = _get_layer_digest_v2
+    else:
         raise NotSupported(
             "Invalid schema version in manifest.json file: {} "
-            "(currently supported is 2)".format(manifest.get("schemaVersion"))
+            "(currently supported are schema versions 1 and 2)".format(manifest.get("schemaVersion"))
         )
 
     layers = []
-    _LOGGER.debug("Layers found: %r", manifest["layers"])
-    for layer_def in manifest["layers"]:
-        layer_digest = layer_def["digest"].split(":", maxsplit=1)[-1]
+    _LOGGER.debug("Layers found: %r", manifest_layers)
+    for layer_def in manifest_layers:
+        layer_digest = get_layer_digest(layer_def)
 
         _LOGGER.debug("Extracting layer %r", layer_digest)
         layers.append(layer_digest)
@@ -321,4 +499,7 @@ def run_analyzers(path: str, timeout: int = None) -> dict:
         "rpm-dependencies": _run_rpm_repoquery(path, timeout=timeout),
         "deb": deb_packages,
         "deb-dependencies": _run_apt_cache_show(path, deb_packages, timeout=timeout),
+        "python-files": _gather_python_file_digests(path),
+        "operating-system": _gather_os_info(path),
+        "system-symbols": _get_system_symbols(path),
     }

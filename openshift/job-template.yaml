@@ -35,6 +35,10 @@ parameters:
     displayName: Log package extract
     required: true
     value: 'INFO'
+  - name: THOTH_PACKAGE_EXTRACT_METADATA
+    description: Additional metadata passed with the request.
+    displayName: Package extract metadata
+    required: true
   - name: THOTH_ANALYZER_NO_TLS_VERIFY
     description: Do not perform X.509 certificates verification
     displayName: Disable TLS verification
@@ -44,6 +48,16 @@ parameters:
     description: Credentials for connecting to registry to pull images from
     displayName: Registry credentials
     required: false
+  - name: THOTH_REGISTRY
+    description: Registry server from where Image is to be pulled
+    displayName: Registry
+    required: true
+    value: 'docker-registry.default.svc:5000'
+  - name: IMAGE_STREAM_PROJECT_NAME
+    description: Project where ImageStream is present
+    displayName: ImageStream Project
+    required: true
+    value: 'thoth-infra-stage'
 
 objects:
   - apiVersion: batch/v1
@@ -68,7 +82,7 @@ objects:
           automountServiceAccountToken: false
           containers:
             - name: package-extract
-              image: package-extract
+              image: "${THOTH_REGISTRY}/${IMAGE_STREAM_PROJECT_NAME}/package-extract"
               livenessProbe:
                 # Give analyzer 30 minutes to compute results, kill it if it was not able result anything.
                 tcpSocket:
@@ -79,6 +93,8 @@ objects:
               env:
                 - name: THOTH_LOG_PACKAGE_EXTRACT
                   value: ${THOTH_LOG_PACKAGE_EXTRACT}
+                - name: THOTH_PACKAGE_EXTRACT_METADATA
+                  value: ${THOTH_PACKAGE_EXTRACT_METADATA}
                 - name: THOTH_ANALYZER
                   value: package-extract
                 - name: THOTH_ANALYZED_IMAGE
@@ -94,6 +110,11 @@ objects:
                     secretKeyRef:
                       name: thoth
                       key: sentry-dsn
+                - name: THOTH_DEPLOYMENT_NAME
+                  valueFrom:
+                    configMapKeyRef:
+                      key: storage-bucket-name
+                      name: thoth
               resources:
                 limits:
                   memory: '256Mi'
